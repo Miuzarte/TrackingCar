@@ -1,0 +1,474 @@
+#include <REGX52.H>
+// #include "delay.h"
+#include "key.h"
+#include "nixie.h"
+#include "timer.h"
+#include "typedef.h"
+
+// 小车不能跑出赛道三次以上（不包括三次）
+
+// 左右转弯时相应的LED亮
+// 转弯时蜂鸣器响起
+
+// [TODO]? 显示速度与路程
+
+// 超声波避障与
+// [TODO] 显示离障碍物距离
+
+#define NixieData P0
+
+#define Ir P1
+#define Ir0 P1_0 // 最右
+#define Ir1 P1_1
+#define Ir2 P1_2
+#define Ir3 P1_3
+#define Ir4 P1_4
+#define Ir5 P1_5
+#define Ir6 P1_6
+#define Ir7 P1_7 // 最左
+
+#define Nixie0 P2_0
+#define Nixie1 P2_1
+#define Nixie2 P2_2
+#define Nixie3 P2_3
+#define UltrasonicTrig P2_4
+#define UltrasonicEcho P2_5
+#define LedRight P2_6
+#define LedLeft P2_7
+
+#define Motor0 P3_0
+#define Motor1 P3_1
+#define MotorIn1 P3_2
+#define MotorIn2 P3_3
+#define MotorIn3 P3_4
+#define MotorIn4 P3_5
+#define Buzzer P3_6 // 无源
+bit BuzzerEnabled = 0;
+#define RD P3_7
+
+uint8 SensorRaw = 0;  // 1=检测到黑线
+
+// PD控制器参数
+float32 Kp = 2; // 比例系数 0.5 - 1.5
+float32 Kd = 0; // 微分系数 1.0 - 3.0
+int16 LastBias = 0;
+
+// 传感器权重
+const int8 SensorWeights[8] = { -7, -5, -3, -1, 1, 3, 5, 7 };
+
+int16 Correction;
+int16 SpeedLeft = 0; // 负数反转
+int16 SpeedRight = 0;
+
+volatile uint8 Counter = 0;
+uint8 PwmC0, PwmC1;
+
+void Search() {
+#define BASE_SPEED 60
+    int16 weightedSum = 0;
+    uint8 activeSensors = 0;
+
+    uint8 i;
+    int16 currentBias;
+    int16 derivative;
+
+    // 计算加权和和激活的传感器数量
+    for (i = 0; i < 8; i++) {
+        if (SensorRaw & (1 << i)) {
+            weightedSum += SensorWeights[i];
+            activeSensors += 1;
+        }
+    }
+
+    // 计算当前偏差（归一化到-100到+100）
+    currentBias = 0;
+    if (activeSensors > 0) {
+        currentBias = (weightedSum * 100) / (activeSensors * 7);
+    } else {
+        // 没有传感器检测到线，保持上一次偏差
+        currentBias = LastBias;
+    }
+
+    // 计算微分（偏差变化率）
+    derivative = currentBias - LastBias;
+
+    // PD控制输出
+    Correction = (int16)(Kp * currentBias + Kd * derivative);
+
+    // 应用修正
+    SpeedLeft = BASE_SPEED + Correction;
+    SpeedRight = BASE_SPEED - Correction;
+    // Nixie0Display(SpeedLeft / 10);
+    // Nixie1Display(SpeedLeft % 10);
+    // Nixie0Display(SpeedRight / 10);
+    // Nixie1Display(SpeedRight % 10);
+
+    // 限制速度范围
+    if (SpeedLeft < 0) SpeedLeft = 0;
+    if (SpeedLeft > 100) SpeedLeft = 100;
+    if (SpeedRight < 0) SpeedRight = 0;
+    if (SpeedRight > 100) SpeedRight = 100;
+    // Nixie2Display(SpeedLeft / 10);
+    // Nixie3Display(SpeedLeft % 10);
+    // Nixie2Display(SpeedRight / 10);
+    // Nixie3Display(SpeedRight % 10);
+
+    // 更新历史偏差
+    LastBias = currentBias;
+
+    // NixieDisplayNumber(SensorRaw);
+    // NixieDisplayNumber(currentBias);
+}
+
+void Run() {
+    uint8 tempSpeedLeft = (SpeedLeft >= 0) ? SpeedLeft : -SpeedLeft;
+    uint8 tempSpeedRight = (SpeedRight >= 0) ? SpeedRight : -SpeedRight;
+
+    if (SpeedLeft == 0 && SpeedRight == 0) {
+        PwmC0 = 0;
+        PwmC1 = 0;
+        MotorIn1 = 0;
+        MotorIn2 = 0;
+        MotorIn3 = 0;
+        MotorIn4 = 0;
+        return;
+    }
+
+    // 设置电机方向
+    if (SpeedLeft >= 0) {
+        MotorIn1 = 1;
+        MotorIn2 = 0;
+    } else {
+        MotorIn1 = 0;
+        MotorIn2 = 1;
+    }
+    if (SpeedRight >= 0) {
+        MotorIn3 = 1;
+        MotorIn4 = 0;
+    } else {
+        MotorIn3 = 0;
+        MotorIn4 = 1;
+    }
+
+    // LED指示转向
+    if (tempSpeedLeft < tempSpeedRight) {
+        LedLeft = 1;
+        LedRight = 0;
+    } else if (tempSpeedLeft > tempSpeedRight) {
+        LedLeft = 0;
+        LedRight = 1;
+    } else {
+        LedLeft = 0;
+        LedRight = 0;
+    }
+
+#define LR_DIFF 0
+    PwmC0 = tempSpeedLeft + LR_DIFF;
+    PwmC1 = tempSpeedRight - LR_DIFF;
+
+    Motor0 = Counter < PwmC0;
+    Motor1 = Counter < PwmC1;
+}
+
+// 超声波状态机
+typedef enum {
+    SONIC_IDLE = 0, // 空闲状态
+    SONIC_TRIGGER, // 发送触发脉冲
+    SONIC_WAIT_ECHO, // 等待回波
+    SONIC_MEASURING, // 测量回波时间
+} SonicStateType;
+
+volatile SonicStateType SonicState = SONIC_IDLE;
+volatile uint8 SonicStartTime = 0;
+volatile uint8 SonicDistance = 0;
+volatile uint8 SonicUpdateFlag = 0; // 新数据就绪标志
+
+// 250us * 4 = 1ms
+#define SONIC_TIMEOUT_MS 10*4 // ~340cm
+#define SONIC_MEASURE_INTERVAL 50*4 // 测量间隔(ms)
+
+// 避障状态机
+typedef enum {
+    AVOID_IDLE = 0, // 正常循迹
+    AVOID_BACKWARD, // 后退
+    AVOID_TURN_RIGHT, // 右转
+    AVOID_FORWARD, // 前进一小段
+} AvoidStateType;
+
+AvoidStateType AvoidState = AVOID_IDLE;
+uint16 AvoidTimer = 0;
+#define AVOID_DISTANCE 30
+#define AVOIDANCE_SPEED 60
+bit InAvoidance = 0;
+
+void DoAvoidance() {
+    switch (AvoidState) {
+    case AVOID_IDLE:
+        // 开始避障：先后退
+        AvoidState = AVOID_BACKWARD;
+        AvoidTimer = 0;
+
+        // 后退
+        SpeedLeft = -AVOIDANCE_SPEED;
+        SpeedRight = -AVOIDANCE_SPEED;
+        Run();
+        break;
+
+    case AVOID_BACKWARD:
+        if (AvoidTimer > 333) {  // 后退
+            AvoidState = AVOID_TURN_RIGHT;
+            AvoidTimer = 0;
+
+            // 原地右转
+            SpeedLeft = AVOIDANCE_SPEED;
+            SpeedRight = -AVOIDANCE_SPEED;
+            Run();
+        }
+        break;
+
+    case AVOID_TURN_RIGHT:
+        if (AvoidTimer > 333) {  // 原地右转
+            AvoidState = AVOID_FORWARD;
+            AvoidTimer = 0;
+
+            // 前进一小段
+            SpeedLeft = AVOIDANCE_SPEED;
+            SpeedRight = AVOIDANCE_SPEED;
+            Run();
+        }
+        break;
+
+    case AVOID_FORWARD:
+        if (AvoidTimer > 1000) {  // 前进 1s
+            // 避障完成
+            AvoidState = AVOID_IDLE;
+            InAvoidance = 0;
+        }
+        break;
+    }
+}
+
+// 终点检测状态机
+typedef enum {
+    FINISH_IDLE = 0,        // 空闲状态
+    FINISH_CANDIDATE,       // 疑似终点
+    FINISH_CONFIRMED,       // 确认终点
+    FINISH_BACKWARD         // 倒车确认
+} FinishStateType;
+
+// 终点检测参数
+#define FINISH_MIN_TIME 200     // 最小全黑时间(ms)
+#define FINISH_MIN_COUNT 8      // 最小全黑次数
+#define FINISH_BACK_TIME 250    // 倒车时间(ms)
+#define FINISH_RACE_TIME 10000   // 最短比赛时间(ms) - 避免起点误判
+
+// 终点检测变量
+FinishStateType FinishState = FINISH_IDLE;
+uint16 FinishTimer = 0;
+uint8 FinishConsecutiveHits = 0;
+bit FinishDetected = 0;          // 终点标志
+uint16 RaceTimer = 0;            // 比赛计时器
+
+void ComprehensiveFinishDetection() {
+    if (FinishDetected || InAvoidance) {
+        return; // 已检测到终点或正在避障，不进行检测
+    }
+
+    switch (FinishState) {
+    case FINISH_IDLE:
+        // 检查所有传感器是否都检测到黑线，且比赛时间超过最短时间
+        if (SensorRaw == 0xFF && RaceTimer > FINISH_RACE_TIME) {
+            FinishState = FINISH_CANDIDATE;
+            FinishTimer = 0;
+            FinishConsecutiveHits = 1;
+        }
+        break;
+
+    case FINISH_CANDIDATE:
+        // 持续检测全黑状态
+        if (SensorRaw == 0xFF) {
+            FinishConsecutiveHits++;
+        } else {
+            // 中途断开，不是终点
+            FinishState = FINISH_IDLE;
+            FinishConsecutiveHits = 0;
+        }
+
+        // 确认条件：持续足够时间且全中次数足够
+        if (FinishTimer > FINISH_MIN_TIME && FinishConsecutiveHits > FINISH_MIN_COUNT) {
+            FinishState = FINISH_CONFIRMED;
+            FinishTimer = 0;
+
+            // 第一阶段：立即停车
+            SpeedLeft = 0;
+            SpeedRight = 0;
+            Run();
+        }
+
+        // 超时重置
+        if (FinishTimer > 500) {
+            FinishState = FINISH_IDLE;
+            FinishConsecutiveHits = 0;
+        }
+        break;
+
+    case FINISH_CONFIRMED:
+        // 等待所有传感器都离开黑线（完全通过终点线）
+        if (SensorRaw == 0x00) {
+            FinishState = FINISH_BACKWARD;
+            FinishTimer = 0;
+
+            // 倒车确保完全过线
+            SpeedLeft = -40;
+            SpeedRight = -40;
+            Run();
+        }
+
+        // 超时保护
+        if (FinishTimer > 1000) {
+            FinishState = FINISH_BACKWARD;
+            FinishTimer = 0;
+        }
+        break;
+
+    case FINISH_BACKWARD:
+        if (FinishTimer > FINISH_BACK_TIME) {
+            // 完全停止，比赛结束
+            FinishState = FINISH_IDLE;
+            FinishDetected = 1;
+            FinishConsecutiveHits = 0;
+        }
+        break;
+    }
+}
+
+int main() {
+    uint16 delay = 2000;
+    for (; delay; delay--) Delay(1);
+
+    Timer0Init();
+    Timer1Init();
+
+    while (1) {
+        // Nixie0Display((int)(Kp * 10) % 10);
+        // Nixie1Display((int)(Kp * 10) / 10);
+        // Nixie2Display((int)(Kd * 10) % 10);
+        // Nixie3Display((int)(Kd * 10) / 10);
+
+        if (InAvoidance) {
+            NixieDisplayNumber(AvoidState);
+        } else if (FinishDetected) {
+            NixieDisplayNumber(7890);
+        } else {
+            // NixieDisplayNumber(SonicDistance);
+            // NixieDisplayNumber(SensorRaw);
+            // Nixie0Display(PwmC0 / 10);
+            // Nixie1Display(PwmC0 % 10);
+            // Nixie2Display(PwmC1 / 10);
+            // Nixie3Display(PwmC1 % 10);
+        }
+
+        if (SonicUpdateFlag && !InAvoidance) {
+            SonicUpdateFlag = 0;
+            if (SonicDistance < AVOID_DISTANCE) {
+                // InAvoidance = 1;
+                AvoidState = AVOID_IDLE;
+            }
+        }
+
+        // [TODO] debug
+        // if (!FinishDetected && !InAvoidance) {
+        //     ComprehensiveFinishDetection();
+        // }
+
+        SensorRaw = Ir;
+        if (InAvoidance) {
+            BuzzerEnabled = 1;
+            DoAvoidance();
+        } else if (FinishDetected) {
+            BuzzerEnabled = 1;
+            SpeedLeft = 0;
+            SpeedRight = 0;
+            Run();
+        } else {
+            Search();
+            Run();
+        }
+    }
+}
+
+// 1ms
+void Timer0_Routine() interrupt 1 {
+    TL0 = 0x66;
+    TH0 = 0xFC;
+    Counter++;
+    Counter %= 100;
+    if (InAvoidance) AvoidTimer++;
+    if (!FinishDetected && !InAvoidance) RaceTimer++;
+    if (FinishState > 0) FinishTimer++;
+
+    // if (BuzzerEnabled && !(Counter % 4)) Buzzer = !Buzzer;
+    Buzzer = BuzzerEnabled;
+}
+
+// 115us 1:4cm
+void Sonic_Routine() interrupt 3 {
+#define SonicRatio 4
+    static uint8 triggerCounter = 0;
+    static uint16 measureCounter = 0;
+
+    switch (SonicState) {
+    case SONIC_IDLE:
+        // 每固定间隔启动一次测量
+        measureCounter++;
+        if (measureCounter >= SONIC_MEASURE_INTERVAL) {
+            measureCounter = 0;
+            SonicState = SONIC_TRIGGER;
+            triggerCounter = 0;
+            UltrasonicTrig = 1; // 开始触发脉冲
+        }
+        break;
+
+    case SONIC_TRIGGER:
+        // 触发脉冲
+        triggerCounter++;
+        if (triggerCounter == 1) {
+            UltrasonicTrig = 0; // 结束触发脉冲
+            SonicState = SONIC_WAIT_ECHO;
+            SonicStartTime = 0;
+        }
+        break;
+
+    case SONIC_WAIT_ECHO:
+        // 等待回波信号变高
+        if (UltrasonicEcho) {
+            SonicState = SONIC_MEASURING;
+            SonicStartTime = 0;
+        }
+        // 超时检测
+        if (SonicStartTime++ > SONIC_TIMEOUT_MS) {
+            SonicState = SONIC_IDLE;
+            SonicDistance = 255;  // 超时, 无回波 (太近)
+            SonicUpdateFlag = 1;
+        }
+        break;
+
+    case SONIC_MEASURING:
+        // 测量回波高电平持续时间
+        if (!UltrasonicEcho) {
+            // SonicDistance = SonicStartTime * SonicRatio;
+            SonicDistance = SonicStartTime << 2;
+            SonicUpdateFlag = 1;
+            SonicState = SONIC_IDLE;
+        } else {
+            SonicStartTime++;
+            // 超时检测
+            if (SonicStartTime > SONIC_TIMEOUT_MS) {
+                SonicState = SONIC_IDLE;
+                SonicDistance = 255;
+                SonicUpdateFlag = 1;
+            }
+        }
+        break;
+    }
+}

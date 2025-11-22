@@ -1,0 +1,679 @@
+#include <REGX52.H>
+// #include "delay.h"
+#include "key.h"
+#include "nixie.h"
+#include "timer.h"
+#include "typedef.h"
+
+uint32 GlobalTime = 0;
+
+#define PAT_0000 0x0
+#define PAT_0001 0x1
+#define PAT_0010 0x2
+#define PAT_0011 0x3
+#define PAT_0100 0x4
+#define PAT_0101 0x5
+#define PAT_0110 0x6
+#define PAT_0111 0x7
+#define PAT_1000 0x8
+#define PAT_1001 0x9
+#define PAT_1010 0xA
+#define PAT_1011 0xB
+#define PAT_1100 0xC
+#define PAT_1101 0xD
+#define PAT_1110 0xE
+#define PAT_1111 0xF
+
+// 小车不能跑出赛道三次以上（不包括三次）
+
+// 左右转弯时相应的LED亮
+// 转弯时蜂鸣器响起
+
+// ]TODO[? 显示速度与路程
+
+// 超声波避障与显示离障碍物距离
+
+#define NixieData P0
+
+#define Ir P1
+#define Ir0 P1_0 // 最右
+#define Ir1 P1_1
+#define Ir2 P1_2
+#define Ir3 P1_3
+#define Ir4 P1_4
+#define Ir5 P1_5
+#define Ir6 P1_6
+#define Ir7 P1_7 // 最左
+
+#define Nixie0 P2_0
+#define Nixie1 P2_1
+#define Nixie2 P2_2
+#define Nixie3 P2_3
+#define UltrasonicTrig P2_4
+#define UltrasonicEcho P2_5
+#define LedRight P2_6
+#define LedLeft P2_7
+
+#define Motor0 P3_0
+#define Motor1 P3_1
+#define MotorIn1 P3_2
+#define MotorIn2 P3_3
+#define MotorIn3 P3_4
+#define MotorIn4 P3_5
+#define Buzzer P3_6 // 无源
+bit BuzzerEnabled = 0;
+#define RD P3_7
+
+// 11000011
+#define EXTRACT_SENSOR_VALUE_EDGE(P) ((P >> 4) & 0x0C | P & 0x03)
+// 00111100
+#define EXTRACT_SENSOR_VALUE_MIDDLE(P) ((P >> 2) & 0x0F)
+uint8 SensorValue = 0; // 8 bits
+uint8 SensorValueEdge = 0; // 4 bits
+uint8 SensorValueMiddle = 0; // 4 bits
+int8 SensorValueBalance = 0; // 左负右正
+
+void CalcSensorValueBalance() {
+    uint8 i;
+    SensorValueBalance = 0;
+    for (i = 0; i < 8; i++) {
+        if (SensorValue & (1 << i)) {
+            if (i < 4) {
+                SensorValueBalance += 1;
+            } else {
+                SensorValueBalance -= 1;
+            }
+        }
+    }
+}
+
+int8 SpeedLeft = 0; // 负数反转
+int8 SpeedRight = 0;
+
+volatile uint8 Counter = 0;
+uint8 PwmC0, PwmC1;
+
+// 1 表示在线上
+void Search() {
+#define BASE_SPEED 75
+#define STEERING_1 5
+#define STEERING_2 10
+#define STEERING_3 15
+#define STEERING_4 25
+
+    switch (SensorValue) {
+    case 0xFF: // 11111111
+    case 0x8D: // 10111101
+    case 0x7E: // 01111110
+    case 0x3C: // 00111100
+        // 终点 停车
+        SpeedLeft = 0;
+        SpeedRight = 0;
+        break;
+
+    default:
+        // 先考虑 edge
+        switch (SensorValueEdge) {
+        case PAT_0001: // 0001
+        case PAT_0010: // 0010
+        case PAT_0011: // 0011
+            SpeedLeft = BASE_SPEED + STEERING_4;
+            SpeedRight = -SpeedLeft;
+            break;
+
+        case PAT_0100: // 0100
+        case PAT_1000: // 1000
+        case PAT_1100: // 1100
+            SpeedRight = BASE_SPEED + STEERING_4;
+            SpeedLeft = -SpeedRight;
+            break;
+
+        case PAT_0110: // 0110
+        case PAT_1001: // 1001
+        case PAT_1111: // 1111
+
+        case PAT_0000: // 0000
+        default: // 不规律样式
+            // 0101 1010
+            // 1101 1011
+            // 1110 0111
+            // 判断中间
+            switch (SensorValueMiddle) {
+            case PAT_0101: //(0101)
+            case PAT_0111: // 0111 小偏左
+                SpeedLeft = BASE_SPEED + STEERING_1;
+                SpeedRight = -STEERING_1;
+                break;
+            case PAT_0010: //(0010)
+            case PAT_0011: // 0011 较偏左
+                SpeedLeft = BASE_SPEED + STEERING_2;
+                SpeedRight = -STEERING_2;
+                break;
+            case PAT_0001: // 0001 大偏左
+                SpeedLeft = BASE_SPEED + STEERING_3;
+                SpeedRight = -STEERING_3;
+                break;
+
+            case PAT_1010: //(1010)
+            case PAT_1110: // 1110 小偏右
+                SpeedLeft = -STEERING_1;
+                SpeedRight = BASE_SPEED + STEERING_1;
+                break;
+            case PAT_0100: //(0100)
+            case PAT_1100: // 1100 较偏右
+                SpeedLeft = -STEERING_2;
+                SpeedRight = BASE_SPEED + STEERING_2;
+                break;
+            case PAT_1000: // 1000 大偏右
+                SpeedLeft = -STEERING_3;
+                SpeedRight = BASE_SPEED + STEERING_3;
+                break;
+
+            case PAT_0000: // 0000 脱线已处理
+            case PAT_0110: // 0110
+            case PAT_1001: //(1001)
+            case PAT_1011: //(1011)
+            case PAT_1101: //(1101)
+            case PAT_1111: // 1111
+                // 预判转弯
+                switch (SensorValueEdge) {
+                case PAT_0001: // 0001
+                case PAT_0010: // 0010
+                case PAT_0011: // 0011
+                    // 即将右转
+                    SpeedLeft = BASE_SPEED + STEERING_3;
+                    SpeedRight = 0;
+                    break;
+
+                case PAT_1000: // 1000
+                case PAT_0100: // 0100
+                case PAT_1100: // 1100
+                    // 即将左转
+                    SpeedLeft = 0;
+                    SpeedRight = BASE_SPEED + STEERING_3;
+                    break;
+
+                case PAT_1111: // 1111 终点
+                    // [TODO] 终点检测
+                    SpeedLeft = 0;
+                    SpeedRight = 0;
+                    break;
+
+                case PAT_0000: // 00 继续跟线
+                default:
+                    SpeedLeft = BASE_SPEED;
+                    SpeedRight = BASE_SPEED;
+                }
+                break;
+            }
+        }
+
+    }
+}
+
+void Run() {
+    static int8 lastSpeedLeft;
+    static int8 lastSpeedRight;
+
+    uint8 tempSpeedLeft;
+    uint8 tempSpeedRight;
+
+    // if (lastSpeedLeft == SpeedLeft && lastSpeedRight == SpeedRight) {
+    //     goto SET_MOTOR; // 不需要重新计算
+    // }
+    lastSpeedLeft = SpeedLeft;
+    lastSpeedRight = SpeedRight;
+
+    tempSpeedLeft = (SpeedLeft >= 0) ? SpeedLeft : -SpeedLeft;
+    tempSpeedRight = (SpeedRight >= 0) ? SpeedRight : -SpeedRight;
+
+    if (SpeedLeft == 0 && SpeedRight == 0) {
+        PwmC0 = 0;
+        PwmC1 = 0;
+        MotorIn1 = 0;
+        MotorIn2 = 0;
+        MotorIn3 = 0;
+        MotorIn4 = 0;
+        return;
+    }
+
+    // 设置电机方向
+    if (SpeedLeft >= 0) {
+        MotorIn1 = 1;
+        MotorIn2 = 0;
+    } else {
+        MotorIn1 = 0;
+        MotorIn2 = 1;
+    }
+    if (SpeedRight >= 0) {
+        MotorIn3 = 1;
+        MotorIn4 = 0;
+    } else {
+        MotorIn3 = 0;
+        MotorIn4 = 1;
+    }
+
+    // LED指示转向
+    if (tempSpeedLeft < tempSpeedRight) {
+        LedLeft = 1;
+        LedRight = 0;
+    } else if (tempSpeedLeft > tempSpeedRight) {
+        LedLeft = 0;
+        LedRight = 1;
+    } else {
+        LedLeft = 0;
+        LedRight = 0;
+    }
+
+#define LR_DIFF 0
+    PwmC0 = tempSpeedLeft + LR_DIFF;
+    PwmC1 = tempSpeedRight - LR_DIFF;
+
+    // SET_MOTOR:
+    Motor0 = Counter < PwmC0;
+    Motor1 = Counter < PwmC1;
+}
+
+// 倒车找线状态机
+typedef enum {
+    REVERSE_IDLE = 0,
+    REVERSE_BACKWARD,
+    REVERSE_MORE_BACKWARD,
+    REVERSE_TURN_LEFT,
+    REVERSE_TURN_RIGHT,
+    REVERSE_DONE,
+} ReverseStateType;
+
+ReverseStateType ReverseState = REVERSE_IDLE;
+ReverseStateType ReverseStateTemp = REVERSE_IDLE;
+uint16 ReverseTimer = 0;
+bit InReverse = 0;
+
+#define LOST_LINE_DEBOUNCE_COUNT 8
+#define FOUND_LINE_DEBOUNCE_COUNT 4
+uint8 LostLineCount = 0;
+uint8 FoundLineCount = 0;
+#define REVERSE_COMBO_INTERVAL 100 // ms
+uint32 LastReverseTime = 0;
+uint8 ReverseCombo = 0; // 连续尝试倒车找线的次数
+// 倒车找到线后, 一段时间内的循迹取决于该模式
+#define REVERSE_FOUND_LINE_PATTERN_OVERWRITE_DURATION 500
+uint8 ReverseFoundLinePatternOverwrite = 0;
+
+void ReverseFindLine() {
+#define REVERSE_BACK_TIME_MAX 750 // 最大倒车时间
+#define REVERSE_BACK_TIME_STEP 50 // combo 步长
+#define REVERSE_BACK_TIME_MORE 250 // 多倒车一段时间
+#define REVERSE_TURN_TIME 750 // 最大旋转时间
+#define REVERSE_SPEED 50
+#define TURN_SPEED 50
+
+    switch (ReverseState) {
+    case REVERSE_IDLE:
+        ReverseState = REVERSE_BACKWARD;
+        ReverseTimer = 0; // timer0 1ms 自增
+        // BuzzerEnabled = 1; // 不用响
+
+        if (GlobalTime - LastReverseTime < REVERSE_COMBO_INTERVAL) {
+            ReverseCombo++;
+        } else {
+            ReverseCombo = 0;
+        }
+        break;
+
+    case REVERSE_BACKWARD:
+        SpeedLeft = -REVERSE_SPEED;
+        SpeedRight = -REVERSE_SPEED;
+        Run();
+
+        if (FoundLineCount >= FOUND_LINE_DEBOUNCE_COUNT) {
+            ReverseFoundLinePatternOverwrite = SensorValue;
+            // 重新检测到线 判断线偏向哪侧
+            if (SensorValueBalance < 0) {
+                ReverseState = REVERSE_TURN_LEFT;
+            } else {
+                ReverseState = REVERSE_TURN_RIGHT;
+            }
+            ReverseStateTemp = ReverseState;
+            ReverseState = REVERSE_MORE_BACKWARD;
+            ReverseTimer = 0;
+        } else if (ReverseTimer > REVERSE_BACK_TIME_MAX + ReverseCombo * REVERSE_BACK_TIME_STEP) {
+            // 如果倒车时间到了还是没线，则默认向右找
+            // [TODO] 如果倒车超时还没找到
+            ReverseState = REVERSE_TURN_RIGHT;
+            ReverseTimer = 0;
+        }
+        break;
+
+    case REVERSE_MORE_BACKWARD:
+        SpeedLeft = -REVERSE_SPEED;
+        SpeedRight = -REVERSE_SPEED;
+        Run();
+        if (ReverseTimer > REVERSE_BACK_TIME_MORE) {
+            ReverseState = ReverseStateTemp;
+            ReverseTimer = 0;
+        }
+        break;
+
+    case REVERSE_TURN_LEFT:
+        SpeedLeft = -TURN_SPEED;
+        SpeedRight = TURN_SPEED;
+        Run();
+
+        if (!(SensorValueMiddle & PAT_1001)) {
+            ReverseState = REVERSE_DONE;
+            ReverseTimer = 0;
+        } else if (ReverseTimer > REVERSE_TURN_TIME) {
+            ReverseState = REVERSE_DONE;
+            ReverseTimer = 0;
+        }
+        break;
+
+    case REVERSE_TURN_RIGHT:
+        SpeedLeft = TURN_SPEED;
+        SpeedRight = -TURN_SPEED;
+        Run();
+
+        switch (SensorValueMiddle) {
+        case PAT_0110:
+        case PAT_1001:
+        case PAT_1111:
+            ReverseState = REVERSE_DONE;
+            ReverseTimer = 0;
+            break;
+
+        default:
+            if (ReverseTimer > REVERSE_TURN_TIME) {
+                ReverseState = REVERSE_DONE;
+                ReverseTimer = 0;
+            }
+        }
+        break;
+
+    case REVERSE_DONE:
+        // SpeedLeft = 0;
+        // SpeedRight = 0;
+        // Run();
+
+        ReverseState = REVERSE_IDLE;
+        InReverse = 0;
+        LastReverseTime = GlobalTime;
+        break;
+    }
+}
+
+// 超声波状态机
+typedef enum {
+    SONIC_IDLE = 0, // 空闲状态
+    SONIC_TRIGGER, // 发送触发脉冲
+    SONIC_WAIT_ECHO, // 等待回波
+    SONIC_MEASURING, // 测量回波时间
+} SonicStateType;
+
+volatile SonicStateType SonicState = SONIC_IDLE;
+volatile uint8 SonicStartTime = 0;
+volatile uint8 SonicDistance = 0; // 0 表示无回波
+volatile uint8 SonicUpdateFlag = 0; // 新数据就绪标志
+
+// [TODO] fix scale to 115us
+// 250us * 4 = 1ms
+#define SONIC_TIMEOUT_MS 10*4 // ~340cm
+#define SONIC_MEASURE_INTERVAL 50*4 // 测量间隔()
+
+// 避障状态机
+typedef enum {
+    AVOID_IDLE = 0, // 正常循迹
+    AVOID_BACKWARD, // 后退
+    AVOID_TURN_RIGHT, // 右转
+    AVOID_FORWARD, // 前进一小段
+    AVOID_TURN_LEFT, // 左转
+    AVOID_BACK_LINE, // 直行找线
+    AVOID_DONE, // 结束
+} AvoidStateType;
+
+AvoidStateType AvoidState = AVOID_IDLE;
+uint16 AvoidTimer = 0;
+bit InAvoidance = 0;
+
+void DoAvoidance() {
+#define AVOIDANCE_SPEED 60
+#define BACKWARD_TIME 333
+#define TURN_TIME 333
+#define FORWARD_TIME 667
+
+    switch (AvoidState) {
+    case AVOID_IDLE:
+        AvoidState = AVOID_BACKWARD;
+        AvoidTimer = 0; // timer0 1ms 自增
+        BuzzerEnabled = 1;
+        break;
+
+    case AVOID_BACKWARD: // 后退
+        SpeedLeft = -AVOIDANCE_SPEED;
+        SpeedRight = -AVOIDANCE_SPEED;
+        Run();
+
+        if (AvoidTimer > 333) {
+            AvoidState = AVOID_TURN_RIGHT;
+            AvoidTimer = 0;
+        }
+        break;
+
+    case AVOID_TURN_RIGHT: // 原地右转
+        SpeedLeft = AVOIDANCE_SPEED;
+        SpeedRight = -AVOIDANCE_SPEED;
+        Run();
+
+        if (AvoidTimer > TURN_TIME) {
+            AvoidState = AVOID_FORWARD;
+            AvoidTimer = 0;
+            BuzzerEnabled = 0; // 右转结束后停止蜂鸣器
+        }
+        break;
+
+    case AVOID_FORWARD: // 前进一小段
+        SpeedLeft = AVOIDANCE_SPEED;
+        SpeedRight = AVOIDANCE_SPEED;
+        Run();
+
+        if (AvoidTimer > FORWARD_TIME) {
+            AvoidState = AVOID_TURN_LEFT;
+            AvoidTimer = 0;
+        }
+        break;
+
+    case AVOID_TURN_LEFT: // 原地左转
+        SpeedLeft = -AVOIDANCE_SPEED;
+        SpeedRight = AVOIDANCE_SPEED;
+        Run();
+
+        if (AvoidTimer > TURN_TIME) {
+            AvoidState = AVOID_BACK_LINE;
+            AvoidTimer = 0;
+        }
+        break;
+
+    case AVOID_BACK_LINE: // 直行回线
+        // SpeedLeft = AVOIDANCE_SPEED / 2;
+        SpeedLeft = AVOIDANCE_SPEED;
+        // SpeedRight = AVOIDANCE_SPEED / 2;
+        SpeedRight = AVOIDANCE_SPEED;
+        Run();
+
+        // 此时要保证面朝路线, 无超时处理
+        // if (SensorValue != 0x00) {
+        // if (SensorValueMiddle != 0x00) { // 判断中间的传感器
+        if (FoundLineCount >= 8) {
+            AvoidState = AVOID_DONE;
+            AvoidTimer = 0;
+        }
+        break;
+
+    case AVOID_DONE:
+        // SpeedLeft = 0;
+        // SpeedRight = 0;
+        // Run();
+
+        AvoidState = AVOID_IDLE;
+        InAvoidance = 0;
+        break;
+    }
+}
+
+int main() {
+    uint16 delay = 2000;
+
+    Timer0Init();
+    // Timer1Init();
+
+    // BuzzerEnabled = 1;
+    for (; delay; delay--) Delay(1);
+    BuzzerEnabled = 0;
+
+    while (1) {
+        // NixieDisplayNumber(Counter);
+        if (InAvoidance) {
+            NixieDisplayNumber(AvoidState);
+        } else if (InReverse) {
+            NixieDisplayNumber(ReverseState);
+        } else {
+            NixieDisplayNumber(SonicDistance);
+            // NixieDisplayNumber(SensorValue);
+            // Nixie0Display(PwmC0 / 10);
+            // Nixie1Display(PwmC0 % 10);
+            // Nixie2Display(PwmC1 / 10);
+            // Nixie3Display(PwmC1 % 10);
+            // Nixie0Display(SensorValueEdge / 10);
+            // Nixie1Display(SensorValueEdge % 10);
+            // Nixie2Display(SensorValueMiddle / 10);
+            // Nixie3Display(SensorValueMiddle % 10);
+        }
+
+        if (ReverseFoundLinePatternOverwrite && GlobalTime - LastReverseTime < REVERSE_FOUND_LINE_PATTERN_OVERWRITE_DURATION) {
+            SensorValue = ReverseFoundLinePatternOverwrite;
+        } else {
+            SensorValue = P1;
+            ReverseFoundLinePatternOverwrite = 0x00;
+        }
+        SensorValueEdge = EXTRACT_SENSOR_VALUE_EDGE(SensorValue);
+        SensorValueMiddle = EXTRACT_SENSOR_VALUE_MIDDLE(SensorValue);
+        CalcSensorValueBalance();
+
+        // 脱线判定消抖
+        if (SensorValue) {
+            LostLineCount = 0;
+        } else {
+            if (LostLineCount < LOST_LINE_DEBOUNCE_COUNT) LostLineCount++;
+        }
+        // 找线判定消抖
+        if (SensorValue) {
+            if (FoundLineCount < FOUND_LINE_DEBOUNCE_COUNT) FoundLineCount++;
+        } else {
+            FoundLineCount = 0;
+        }
+
+        if (InAvoidance) {
+            // 优先级 1: 避障
+            DoAvoidance();
+
+        } else if (InReverse) {
+            // 优先级 2: 倒车找线
+            ReverseFindLine();
+
+        } else if (SonicUpdateFlag && SonicDistance > 0 && SonicDistance < 30) {
+            // 避障
+            SonicUpdateFlag = 0;
+            InAvoidance = 1;
+            AvoidState = AVOID_IDLE;
+
+        } else if (!InAvoidance && LostLineCount >= LOST_LINE_DEBOUNCE_COUNT) {
+            // 倒车找线
+            InReverse = 1;
+            ReverseState = REVERSE_IDLE;
+
+        } else {
+            Search();
+            Run();
+
+        }
+
+    }
+}
+
+// 1ms
+void Timer0_Routine() interrupt 1 {
+    TL0 = 0x66;
+    TH0 = 0xFC;
+    Counter++;
+    Counter %= 100;
+
+    GlobalTime++;
+
+    if (InAvoidance) AvoidTimer++;
+    if (InReverse) ReverseTimer++;
+
+    if (BuzzerEnabled && !(Counter % 4)) Buzzer = !Buzzer;
+    // Buzzer = BuzzerEnabled;
+}
+
+// 115us 1:4cm
+void Sonic_Routine() interrupt 3 {
+#define SonicRatio 4
+    static uint8 triggerCounter = 0;
+    static uint16 measureCounter = 0;
+
+    switch (SonicState) {
+    case SONIC_IDLE:
+        // 每固定间隔启动一次测量
+        measureCounter++;
+        if (measureCounter >= SONIC_MEASURE_INTERVAL) {
+            measureCounter = 0;
+            SonicState = SONIC_TRIGGER;
+            triggerCounter = 0;
+            UltrasonicTrig = 1; // 开始触发脉冲
+        }
+        break;
+
+    case SONIC_TRIGGER:
+        // 触发脉冲
+        triggerCounter++;
+        if (triggerCounter == 1) {
+            UltrasonicTrig = 0; // 结束触发脉冲
+            SonicState = SONIC_WAIT_ECHO;
+            SonicStartTime = 0;
+        }
+        break;
+
+    case SONIC_WAIT_ECHO:
+        // 等待回波信号变高
+        if (UltrasonicEcho) {
+            SonicState = SONIC_MEASURING;
+            SonicStartTime = 0;
+        }
+        // 超时检测
+        if (SonicStartTime++ > SONIC_TIMEOUT_MS) {
+            SonicState = SONIC_IDLE;
+            SonicDistance = 253;  // 超时, 无回波 (太近)
+            SonicUpdateFlag = 1;
+        }
+        break;
+
+    case SONIC_MEASURING:
+        // 测量回波高电平持续时间
+        if (!UltrasonicEcho) {
+            // SonicDistance = SonicStartTime * SonicRatio;
+            SonicDistance = SonicStartTime << 2;
+            SonicUpdateFlag = 1;
+            SonicState = SONIC_IDLE;
+        } else {
+            SonicStartTime++;
+            // 超时检测
+            if (SonicStartTime > SONIC_TIMEOUT_MS) {
+                SonicState = SONIC_IDLE;
+                SonicDistance = 254;
+                SonicUpdateFlag = 1;
+            }
+        }
+        break;
+    }
+}
